@@ -199,6 +199,22 @@ describe("applyPluginAutoEnable", () => {
       expect(result.changes).toEqual([]);
     });
 
+    it("resolves prefixed plugin id when manifest channel differs from plugin id", () => {
+      // Covers external plugins where the plugin id has a vendor prefix
+      // (e.g. "openclaw-foo" declares channels: ["foo"]).
+      const result = applyPluginAutoEnable({
+        config: {
+          channels: { foo: { credentials: { clientId: "x" } } },
+        },
+        env: {},
+        manifestRegistry: makeRegistry([{ id: "openclaw-foo", channels: ["foo"] }]),
+      });
+
+      expect(result.config.plugins?.entries?.["openclaw-foo"]?.enabled).toBe(true);
+      expect(result.config.plugins?.entries?.["foo"]).toBeUndefined();
+      expect(result.changes.join("\n")).toContain("foo configured, enabled automatically.");
+    });
+
     it("falls back to channel key as plugin id when no installed manifest declares the channel", () => {
       // Without a matching manifest entry, behavior is unchanged (backward compat).
       const result = applyPluginAutoEnable({
