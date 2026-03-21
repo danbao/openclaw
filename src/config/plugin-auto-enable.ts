@@ -1,4 +1,6 @@
+import { hasAnyWhatsAppAuth } from "../../extensions/whatsapp/api.js";
 import { normalizeProviderId } from "../agents/model-selection.js";
+import { hasMeaningfulChannelConfig } from "../channels/config-presence.js";
 import {
   getChannelPluginCatalogEntry,
   listChannelPluginCatalogEntries,
@@ -13,7 +15,6 @@ import {
   type PluginManifestRegistry,
 } from "../plugins/manifest-registry.js";
 import { isRecord } from "../utils.js";
-import { hasAnyWhatsAppAuth } from "../web/accounts.js";
 import type { OpenClawConfig } from "./config.js";
 import { ensurePluginAllowlisted } from "./plugins-allowlist.js";
 
@@ -27,26 +28,15 @@ export type PluginAutoEnableResult = {
   changes: string[];
 };
 
-const CHANNEL_PLUGIN_IDS = Array.from(
-  new Set([
-    ...listChatChannels().map((meta) => meta.id),
-    ...listChannelPluginCatalogEntries().map((entry) => entry.id),
-  ]),
-);
-
 const PROVIDER_PLUGIN_IDS: Array<{ pluginId: string; providerId: string }> = [
-  { pluginId: "google-gemini-cli-auth", providerId: "google-gemini-cli" },
+  { pluginId: "google", providerId: "google-gemini-cli" },
   { pluginId: "qwen-portal-auth", providerId: "qwen-portal" },
   { pluginId: "copilot-proxy", providerId: "copilot-proxy" },
-  { pluginId: "minimax-portal-auth", providerId: "minimax-portal" },
+  { pluginId: "minimax", providerId: "minimax-portal" },
 ];
 
 function hasNonEmptyString(value: unknown): boolean {
   return typeof value === "string" && value.trim().length > 0;
-}
-
-function recordHasKeys(value: unknown): boolean {
-  return isRecord(value) && Object.keys(value).length > 0;
 }
 
 function accountsHaveKeys(value: unknown, keys: readonly string[]): boolean {
@@ -166,7 +156,7 @@ function isStructuredChannelConfigured(
   if (spec.accountStringKeys && accountsHaveKeys(entry.accounts, spec.accountStringKeys)) {
     return true;
   }
-  return recordHasKeys(entry);
+  return hasMeaningfulChannelConfig(entry);
 }
 
 function isWhatsAppConfigured(cfg: OpenClawConfig): boolean {
@@ -177,12 +167,12 @@ function isWhatsAppConfigured(cfg: OpenClawConfig): boolean {
   if (!entry) {
     return false;
   }
-  return recordHasKeys(entry);
+  return hasMeaningfulChannelConfig(entry);
 }
 
 function isGenericChannelConfigured(cfg: OpenClawConfig, channelId: string): boolean {
   const entry = resolveChannelConfig(cfg, channelId);
-  return recordHasKeys(entry);
+  return hasMeaningfulChannelConfig(entry);
 }
 
 export function isChannelConfigured(
@@ -302,9 +292,25 @@ function buildChannelToPluginIdMap(registry: PluginManifestRegistry): Map<string
   return map;
 }
 
+function resolvePluginIdFromConfig(cfg: OpenClawConfig, channelKey: string): string | null {
+  const suffix = `-${channelKey}`;
+  const knownIds: string[] = [
+    ...Object.keys(cfg.plugins?.installs ?? {}),
+    ...Object.keys(cfg.plugins?.entries ?? {}),
+    ...(Array.isArray(cfg.plugins?.allow) ? cfg.plugins.allow : []),
+  ];
+  for (const id of knownIds) {
+    if (typeof id === "string" && id.endsWith(suffix)) {
+      return id;
+    }
+  }
+  return null;
+}
+
 function resolvePluginIdForChannel(
   channelId: string,
   channelToPluginId: ReadonlyMap<string, string>,
+  cfg: OpenClawConfig,
 ): string {
   // Third-party plugins can expose a channel id that differs from their
   // manifest id; plugins.entries must always be keyed by manifest id.
@@ -312,11 +318,24 @@ function resolvePluginIdForChannel(
   if (builtInId) {
     return builtInId;
   }
-  return channelToPluginId.get(channelId) ?? channelId;
+  // Prefer the manifest registry mapping (authoritative, read from plugin
+  // manifests on disk). Fall back to matching against config-known plugin
+  // ids when the registry has no entry – e.g. the plugin is recorded in
+  // plugins.installs but the extensions dir hasn't been scanned yet.
+  return channelToPluginId.get(channelId) ?? resolvePluginIdFromConfig(cfg, channelId) ?? channelId;
 }
 
-function collectCandidateChannelIds(cfg: OpenClawConfig): string[] {
-  const channelIds = new Set<string>(CHANNEL_PLUGIN_IDS);
+function listKnownChannelPluginIds(env: NodeJS.ProcessEnv): string[] {
+  return Array.from(
+    new Set([
+      ...listChatChannels().map((meta) => meta.id),
+      ...listChannelPluginCatalogEntries({ env }).map((entry) => entry.id),
+    ]),
+  );
+}
+
+function collectCandidateChannelIds(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): string[] {
+  const channelIds = new Set<string>(listKnownChannelPluginIds(env));
   const configuredChannels = cfg.channels as Record<string, unknown> | undefined;
   if (!configuredChannels || typeof configuredChannels !== "object") {
     return Array.from(channelIds);
@@ -339,7 +358,7 @@ function resolveConfiguredPlugins(
   const changes: PluginEnableChange[] = [];
   // Build reverse map: channel ID → plugin ID from installed plugin manifests.
   const channelToPluginId = buildChannelToPluginIdMap(registry);
-  for (const channelId of collectCandidateChannelIds(cfg)) {
+  for (const channelId of collectCandidateChannelIds(cfg, env)) {
     const pluginId = resolvePluginIdForChannel(channelId, channelToPluginId);
     if (isChannelConfigured(cfg, channelId, env)) {
       changes.push({ pluginId, reason: `${channelId} configured` });
@@ -353,6 +372,16 @@ function resolveConfiguredPlugins(
         reason: `${mapping.providerId} auth configured`,
       });
     }
+  }
+  const backendRaw =
+    typeof cfg.acp?.backend === "string" ? cfg.acp.backend.trim().toLowerCase() : "";
+  const acpConfigured =
+    cfg.acp?.enabled === true || cfg.acp?.dispatch?.enabled === true || backendRaw === "acpx";
+  if (acpConfigured && (!backendRaw || backendRaw === "acpx")) {
+    changes.push({
+      pluginId: "acpx",
+      reason: "ACP runtime configured",
+    });
   }
   return changes;
 }
@@ -380,12 +409,12 @@ function isPluginDenied(cfg: OpenClawConfig, pluginId: string): boolean {
   return Array.isArray(deny) && deny.includes(pluginId);
 }
 
-function resolvePreferredOverIds(pluginId: string): string[] {
+function resolvePreferredOverIds(pluginId: string, env: NodeJS.ProcessEnv): string[] {
   const normalized = normalizeChatChannelId(pluginId);
   if (normalized) {
     return getChatChannelMeta(normalized).preferOver ?? [];
   }
-  const catalogEntry = getChannelPluginCatalogEntry(pluginId);
+  const catalogEntry = getChannelPluginCatalogEntry(pluginId, { env });
   return catalogEntry?.meta.preferOver ?? [];
 }
 
@@ -393,6 +422,7 @@ function shouldSkipPreferredPluginAutoEnable(
   cfg: OpenClawConfig,
   entry: PluginEnableChange,
   configured: PluginEnableChange[],
+  env: NodeJS.ProcessEnv,
 ): boolean {
   for (const other of configured) {
     if (other.pluginId === entry.pluginId) {
@@ -404,7 +434,7 @@ function shouldSkipPreferredPluginAutoEnable(
     if (isPluginExplicitlyDisabled(cfg, other.pluginId)) {
       continue;
     }
-    const preferOver = resolvePreferredOverIds(other.pluginId);
+    const preferOver = resolvePreferredOverIds(other.pluginId, env);
     if (preferOver.includes(entry.pluginId)) {
       return true;
     }
@@ -467,7 +497,8 @@ export function applyPluginAutoEnable(params: {
   manifestRegistry?: PluginManifestRegistry;
 }): PluginAutoEnableResult {
   const env = params.env ?? process.env;
-  const registry = params.manifestRegistry ?? loadPluginManifestRegistry({ config: params.config });
+  const registry =
+    params.manifestRegistry ?? loadPluginManifestRegistry({ config: params.config, env });
   const configured = resolveConfiguredPlugins(params.config, env, registry);
   if (configured.length === 0) {
     return { config: params.config, changes: [] };
@@ -488,7 +519,7 @@ export function applyPluginAutoEnable(params: {
     if (isPluginExplicitlyDisabled(next, entry.pluginId)) {
       continue;
     }
-    if (shouldSkipPreferredPluginAutoEnable(next, entry, configured)) {
+    if (shouldSkipPreferredPluginAutoEnable(next, entry, configured, env)) {
       continue;
     }
     const allow = next.plugins?.allow;
